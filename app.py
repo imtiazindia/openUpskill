@@ -35,7 +35,7 @@ def test_connection(api_key):
         return False, f"Error: {str(e)}", 0
 
 def main():
-    st.title("🤖 OpenAI Chat Interface")
+    st.title("ask upSkill now")
     st.markdown("---")
     
     # Sidebar for API configuration

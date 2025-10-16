@@ -6,8 +6,8 @@ import os
 
 # Page configuration
 st.set_page_config(
-    page_title="OpenAI Chat Interface",
-    page_icon="🤖",
+    page_title="Ask upSkill",
+    page_icon="X",
     layout="wide"
 )
 

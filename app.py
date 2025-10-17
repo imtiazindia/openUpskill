@@ -384,8 +384,8 @@ def main():
             #else:
                # st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
 
-            if st.session_state.rag_initialized:
-               st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
+            #if st.session_state.rag_initialized:
+               #st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
                 #st.success(".")
                 # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
             #else:

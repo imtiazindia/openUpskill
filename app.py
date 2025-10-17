@@ -18,7 +18,7 @@ from langchain.schema import Document
 
 # Page configuration
 st.set_page_config(
-    page_title="OpenAI Chat Interface",
+    page_title="Ask upSkill Air",
     page_icon="🤖",
     layout="wide"
 )
@@ -286,7 +286,7 @@ def rag_query(question, api_key, max_results=3):
         return None, []
 
 def main():
-    st.title("🤖 OpenAI Chat Interface")
+    st.title("upSkill Air Learning Assistant")
     st.markdown("---")
     
     # Sidebar for API configuration

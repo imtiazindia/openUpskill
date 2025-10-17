@@ -454,7 +454,7 @@ def main():
             st.info("🔑 Please enter a valid OpenAI API key in the sidebar to start chatting")
     
     with col2:
-        st.header("📊 Comprehensive Telemetry")
+        st.header("📊 Telemetry")
         
         if st.session_state.get('connected', False):
             st.success("✅ Connected to OpenAI")

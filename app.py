@@ -11,7 +11,7 @@ from pathlib import Path
 # Additional imports for RAG
 import tiktoken
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document

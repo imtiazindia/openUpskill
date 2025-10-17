@@ -8,12 +8,12 @@ import hashlib
 import json
 from pathlib import Path
 
-# Additional imports for RAG
+# Additional imports for RAG - CORRECTED IMPORTS
 import tiktoken
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader  # CORRECTED LINE
+from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
+from langchain.vectorstores import FAISS  # CORRECTED
 from langchain.schema import Document
 
 # Page configuration

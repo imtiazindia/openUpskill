@@ -378,11 +378,18 @@ def main():
                 st.session_state.messages = []
             
             # Display RAG status
-            if st.session_state.rag_initialized:
-               st.success(".")
+            #if st.session_state.rag_initialized:
+               #st.success(".")
                 # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
-            else:
-                st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
+            #else:
+               # st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
+
+            if st.session_state.rag_initialized:
+               st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
+                #st.success(".")
+                # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
+            #else:
+                
             
             # Display chat messages
             for message in st.session_state.messages:

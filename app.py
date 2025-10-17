@@ -379,7 +379,8 @@ def main():
             
             # Display RAG status
             if st.session_state.rag_initialized:
-               # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
+               st.success(".")
+                # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
             else:
                 st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
             

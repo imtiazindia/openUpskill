@@ -370,7 +370,7 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("💬 Chat Interface")
+        st.header("💬 Type your questions below")
         
         if st.session_state.get('connected', False):
             # Initialize chat history

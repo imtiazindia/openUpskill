@@ -1,15 +1,64 @@
 import streamlit as st
 import openai
-import time
-from datetime import datetime
 import os
+import time
+import json
+import tempfile
+from datetime import datetime
+from pathlib import Path
+import hashlib
+import tiktoken
+
+# LangChain imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import (
+    PyPDFLoader, 
+    TextLoader, 
+    Docx2txtLoader,
+    UnstructuredFileLoader
+)
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
 
 # Page configuration
 st.set_page_config(
-    page_title="Ask upSkill",
-    page_icon="X",
-    layout="wide"
+    page_title="OpenAI RAG Chat Interface",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# Initialize session state
+def initialize_session_state():
+    if 'rag_initialized' not in st.session_state:
+        st.session_state.rag_initialized = False
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = None
+    if 'documents_processed' not in st.session_state:
+        st.session_state.documents_processed = []
+    if 'processing_logs' not in st.session_state:
+        st.session_state.processing_logs = []
+    if 'chunking_stats' not in st.session_state:
+        st.session_state.chunking_stats = {}
+    if 'api_key' not in st.session_state:
+        st.session_state.api_key = None
+    if 'connected' not in st.session_state:
+        st.session_state.connected = False
+
+initialize_session_state()
+
+# Utility functions
+def log_event(event_type, message, details=None):
+    """Comprehensive logging function"""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "type": event_type,
+        "message": message,
+        "details": details
+    }
+    st.session_state.processing_logs.append(log_entry)
+    return log_entry
 
 def validate_api_key(api_key):
     """Validate the OpenAI API key"""
@@ -34,18 +83,233 @@ def test_connection(api_key):
     except Exception as e:
         return False, f"Error: {str(e)}", 0
 
+def calculate_file_hash(file_path):
+    """Calculate MD5 hash of file for duplicate detection"""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def count_tokens(text):
+    """Count tokens in text using tiktoken"""
+    encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
+
+def load_document(file_path):
+    """Load document based on file type"""
+    file_ext = Path(file_path).suffix.lower()
+    
+    log_event("FILE_LOADING", f"Loading document: {Path(file_path).name}", {"extension": file_ext})
+    
+    try:
+        if file_ext == '.pdf':
+            loader = PyPDFLoader(file_path)
+        elif file_ext == '.txt':
+            loader = TextLoader(file_path, encoding='utf-8')
+        elif file_ext in ['.docx', '.doc']:
+            loader = Docx2txtLoader(file_path)
+        else:
+            loader = UnstructuredFileLoader(file_path)
+        
+        documents = loader.load()
+        log_event("FILE_LOADED", f"Successfully loaded {len(documents)} pages from {Path(file_path).name}")
+        return documents
+    except Exception as e:
+        log_event("FILE_ERROR", f"Error loading {Path(file_path).name}", {"error": str(e)})
+        return None
+
+def process_documents(api_key, uploaded_files):
+    """Process uploaded documents for RAG"""
+    if not api_key:
+        log_event("PROCESSING_ERROR", "No API key provided")
+        return False
+    
+    # Create necessary directories
+    os.makedirs("documents", exist_ok=True)
+    os.makedirs("vector_store", exist_ok=True)
+    
+    all_documents = []
+    total_files = len(uploaded_files)
+    
+    log_event("PROCESSING_START", f"Starting processing of {total_files} files")
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, uploaded_file in enumerate(uploaded_files):
+        try:
+            # Save uploaded file temporarily
+            file_path = os.path.join("documents", uploaded_file.name)
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            # Check for duplicates
+            file_hash = calculate_file_hash(file_path)
+            if any(doc.get('hash') == file_hash for doc in st.session_state.documents_processed):
+                log_event("DUPLICATE_SKIPPED", f"Skipped duplicate file: {uploaded_file.name}")
+                os.remove(file_path)
+                continue
+            
+            status_text.text(f"Processing {uploaded_file.name}... ({i+1}/{total_files})")
+            
+            # Load document
+            documents = load_document(file_path)
+            if not documents:
+                continue
+            
+            # Add metadata
+            for doc in documents:
+                doc.metadata.update({
+                    "file_name": uploaded_file.name,
+                    "file_hash": file_hash,
+                    "file_size": uploaded_file.size,
+                    "upload_time": datetime.now().isoformat()
+                })
+            
+            all_documents.extend(documents)
+            
+            # Record processed document
+            st.session_state.documents_processed.append({
+                "name": uploaded_file.name,
+                "hash": file_hash,
+                "size": uploaded_file.size,
+                "pages": len(documents),
+                "processed_at": datetime.now().isoformat()
+            })
+            
+            log_event("FILE_PROCESSED", f"Processed {uploaded_file.name}", {
+                "pages": len(documents),
+                "size": uploaded_file.size
+            })
+            
+        except Exception as e:
+            log_event("PROCESSING_ERROR", f"Error processing {uploaded_file.name}", {"error": str(e)})
+        
+        progress_bar.progress((i + 1) / total_files)
+    
+    if not all_documents:
+        log_event("PROCESSING_ERROR", "No documents were successfully processed")
+        return False
+    
+    # Chunk documents
+    status_text.text("Chunking documents...")
+    log_event("CHUNKING_START", "Starting document chunking")
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=count_tokens
+    )
+    
+    chunks = text_splitter.split_documents(all_documents)
+    
+    # Calculate chunking statistics
+    total_chunks = len(chunks)
+    avg_chunk_size = sum(count_tokens(chunk.page_content) for chunk in chunks) / total_chunks if total_chunks > 0 else 0
+    
+    st.session_state.chunking_stats = {
+        "total_documents": len(all_documents),
+        "total_chunks": total_chunks,
+        "avg_chunk_size": avg_chunk_size,
+        "chunking_time": datetime.now().isoformat()
+    }
+    
+    log_event("CHUNKING_COMPLETE", "Document chunking completed", st.session_state.chunking_stats)
+    
+    # Create vector store
+    status_text.text("Creating vector embeddings...")
+    log_event("EMBEDDING_START", "Starting vector embedding creation")
+    
+    try:
+        embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        
+        # Save vector store
+        vector_store.save_local("vector_store")
+        st.session_state.vector_store = vector_store
+        st.session_state.rag_initialized = True
+        
+        log_event("RAG_INITIALIZED", "RAG system successfully initialized", {
+            "total_chunks": total_chunks,
+            "documents_processed": len(st.session_state.documents_processed)
+        })
+        
+        status_text.text("RAG system ready!")
+        progress_bar.empty()
+        return True
+        
+    except Exception as e:
+        log_event("EMBEDDING_ERROR", "Error creating embeddings", {"error": str(e)})
+        progress_bar.empty()
+        return False
+
+def rag_query(question, api_key, max_results=3):
+    """Perform RAG-based query"""
+    if not st.session_state.vector_store:
+        return None, []
+    
+    try:
+        # Search for relevant documents
+        relevant_docs = st.session_state.vector_store.similarity_search(
+            question, 
+            k=max_results
+        )
+        
+        # Prepare context
+        context = "\n\n".join([doc.page_content for doc in relevant_docs])
+        
+        # Create enhanced prompt
+        enhanced_prompt = f"""
+        Based on the following context, please answer the question. 
+        If the context doesn't contain relevant information, indicate that clearly.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+        
+        # Get response from OpenAI
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context. Be precise and cite relevant information from the context when available."},
+                {"role": "user", "content": enhanced_prompt}
+            ],
+            temperature=0.1
+        )
+        
+        answer = response.choices[0].message.content
+        
+        log_event("RAG_QUERY", "RAG query processed", {
+            "question": question,
+            "documents_retrieved": len(relevant_docs),
+            "answer_length": len(answer)
+        })
+        
+        return answer, relevant_docs
+        
+    except Exception as e:
+        log_event("RAG_ERROR", "Error processing RAG query", {"error": str(e)})
+        return None, []
+
 def main():
-    st.title("ask upSkill now")
+    st.title("🤖 OpenAI RAG Chat Interface")
     st.markdown("---")
     
-    # Sidebar for API configuration
+    # Sidebar for API configuration and RAG setup
     with st.sidebar:
         st.header("🔑 API Configuration")
         api_key = st.text_input(
             "Enter your OpenAI API Key:",
             type="password",
             placeholder="sk-...",
-            help="Get your API key from https://platform.openai.com/api-keys"
+            help="Get your API key from https://platform.openai.com/api-keys",
+            value=st.session_state.get('api_key', '')
         )
         
         if api_key:
@@ -74,22 +338,64 @@ def main():
         else:
             st.warning("Please enter your OpenAI API key")
             st.session_state.connected = False
+        
+        st.markdown("---")
+        
+        # RAG Document Upload Section
+        st.header("📁 RAG Document Setup")
+        
+        if st.session_state.connected:
+            uploaded_files = st.file_uploader(
+                "Choose documents for RAG",
+                type=['pdf', 'txt', 'docx', 'doc'],
+                accept_multiple_files=True,
+                help="Upload PDF, TXT, or DOCX files to build your knowledge base"
+            )
+            
+            if uploaded_files:
+                if st.button("Process Documents for RAG"):
+                    with st.spinner("Processing documents..."):
+                        success = process_documents(api_key, uploaded_files)
+                        if success:
+                            st.success("RAG system initialized successfully!")
+                        else:
+                            st.error("Error initializing RAG system")
+            
+            # Display processed documents
+            if st.session_state.documents_processed:
+                st.subheader("Processed Documents")
+                for doc in st.session_state.documents_processed:
+                    st.write(f"📄 {doc['name']} ({doc['size']} bytes)")
+        
+        else:
+            st.info("🔑 Connect to OpenAI first to enable RAG features")
     
     # Main content area
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("💬 Chat Interface")
+        st.header("💬 RAG Chat Interface")
         
         if st.session_state.get('connected', False):
             # Initialize chat history
             if 'messages' not in st.session_state:
                 st.session_state.messages = []
             
+            # Display RAG status
+            if st.session_state.rag_initialized:
+                st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
+            else:
+                st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
+            
             # Display chat messages
             for message in st.session_state.messages:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
+                    if message.get("sources"):
+                        with st.expander("View Sources"):
+                            for source in message["sources"]:
+                                st.write(f"**Source:** {source.metadata.get('file_name', 'Unknown')}")
+                                st.write(f"**Content:** {source.page_content[:200]}...")
             
             # Chat input
             if prompt := st.chat_input("Ask me anything..."):
@@ -98,29 +404,44 @@ def main():
                 with st.chat_message("user"):
                     st.markdown(prompt)
                 
-                # Generate AI response
+                # Generate response
                 with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        try:
-                            client = openai.OpenAI(api_key=st.session_state.api_key)
-                            
-                            # Create completion with streaming
-                            stream = client.chat.completions.create(
-                                model="gpt-3.5-turbo",
-                                messages=[
-                                    {"role": m["role"], "content": m["content"]}
-                                    for m in st.session_state.messages
-                                ],
-                                stream=True,
-                            )
-                            
-                            response = st.write_stream(stream)
-                            
-                            # Add assistant response to chat history
-                            st.session_state.messages.append({"role": "assistant", "content": response})
-                            
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
+                    with st.spinner("Searching knowledge base..."):
+                        if st.session_state.rag_initialized:
+                            # Use RAG for response
+                            answer, sources = rag_query(prompt, st.session_state.api_key)
+                            if answer:
+                                st.markdown(answer)
+                                if sources:
+                                    with st.expander("View Sources"):
+                                        for i, source in enumerate(sources):
+                                            st.write(f"**Source {i+1}:** {source.metadata.get('file_name', 'Unknown')}")
+                                            st.write(f"**Content:** {source.page_content[:200]}...")
+                                
+                                # Add assistant response to chat history with sources
+                                st.session_state.messages.append({
+                                    "role": "assistant", 
+                                    "content": answer,
+                                    "sources": sources
+                                })
+                            else:
+                                st.error("Error generating RAG response")
+                        else:
+                            # Fallback to regular chat
+                            try:
+                                client = openai.OpenAI(api_key=st.session_state.api_key)
+                                stream = client.chat.completions.create(
+                                    model="gpt-3.5-turbo",
+                                    messages=[
+                                        {"role": m["role"], "content": m["content"]}
+                                        for m in st.session_state.messages
+                                    ],
+                                    stream=True,
+                                )
+                                response = st.write_stream(stream)
+                                st.session_state.messages.append({"role": "assistant", "content": response})
+                            except Exception as e:
+                                st.error(f"Error: {str(e)}")
             
             # Clear chat button
             if st.button("Clear Chat"):
@@ -131,28 +452,57 @@ def main():
             st.info("🔑 Please enter a valid OpenAI API key in the sidebar to start chatting")
     
     with col2:
-        st.header("📊 Telemetry")
+        st.header("📊 Comprehensive Telemetry")
         
         if st.session_state.get('connected', False):
             st.success("✅ Connected to OpenAI")
             st.metric("Connection Status", "Active")
             
-            # Display connection details
-            st.subheader("Connection Details")
-            st.write(f"**Last Test:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            st.write(f"**API Key:** `{st.session_state.api_key[:10]}...`")
-            st.write("**Service:** OpenAI API")
-            st.write("**Status:** Operational")
+            # RAG Status
+            if st.session_state.rag_initialized:
+                st.success("✅ RAG System Active")
+                st.metric("Documents Loaded", len(st.session_state.documents_processed))
+                st.metric("Total Chunks", st.session_state.chunking_stats.get('total_chunks', 0))
+            else:
+                st.warning("⚠️ RAG System Inactive")
             
-            # Chat statistics
-            if st.session_state.messages:
-                user_msgs = len([m for m in st.session_state.messages if m["role"] == "user"])
-                assistant_msgs = len([m for m in st.session_state.messages if m["role"] == "assistant"])
+            # Processing Statistics
+            st.subheader("📈 Processing Statistics")
+            if st.session_state.chunking_stats:
+                stats = st.session_state.chunking_stats
+                st.write(f"**Total Documents:** {stats.get('total_documents', 0)}")
+                st.write(f"**Total Chunks:** {stats.get('total_chunks', 0)}")
+                st.write(f"**Avg Chunk Size:** {stats.get('avg_chunk_size', 0):.1f} tokens")
+                st.write(f"**Last Updated:** {stats.get('chunking_time', 'Never')}")
+            
+            # Recent Logs
+            st.subheader("📋 Recent Activity Logs")
+            logs_to_show = st.session_state.processing_logs[-10:]  # Show last 10 logs
+            for log in reversed(logs_to_show):
+                log_time = datetime.fromisoformat(log['timestamp']).strftime('%H:%M:%S')
+                if log['type'] in ['ERROR', 'PROCESSING_ERROR']:
+                    st.error(f"{log_time} - {log['message']}")
+                elif log['type'] in ['SUCCESS', 'RAG_INITIALIZED']:
+                    st.success(f"{log_time} - {log['message']}")
+                else:
+                    st.info(f"{log_time} - {log['message']}")
                 
-                st.subheader("Chat Statistics")
-                st.write(f"**User Messages:** {user_msgs}")
-                st.write(f"**AI Responses:** {assistant_msgs}")
-                st.write(f"**Total Messages:** {len(st.session_state.messages)}")
+                if log['details'] and st.checkbox(f"Details for {log_time}", key=log['timestamp']):
+                    st.json(log['details'])
+            
+            # Export logs button
+            if st.button("Export Full Logs"):
+                log_data = {
+                    "export_time": datetime.now().isoformat(),
+                    "total_logs": len(st.session_state.processing_logs),
+                    "logs": st.session_state.processing_logs
+                }
+                st.download_button(
+                    label="Download Logs JSON",
+                    data=json.dumps(log_data, indent=2),
+                    file_name=f"rag_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
         else:
             st.warning("⏳ Waiting for connection...")
 

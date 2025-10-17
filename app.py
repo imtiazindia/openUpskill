@@ -463,7 +463,7 @@ def main():
             # RAG Status Section
             st.subheader("🦙 RAG Status")
             if st.session_state.rag_initialized:
-                st.success("✅ RAG System Active")
+                st.success("✅ RAG System Active" {len(st.session_state.documents_processed)} documents loaded")
                 st.metric("Documents Loaded", len(st.session_state.documents_processed))
                 if st.session_state.chunking_stats:
                     st.metric("Total Chunks", st.session_state.chunking_stats.get('total_chunks', 0))

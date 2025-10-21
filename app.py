@@ -16,7 +16,8 @@ import tiktoken
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 #from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
 from langchain_openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS  # CORRECTED
+#from langchain.vectorstores import FAISS  # CORRECTED
+from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 
 # Page configuration

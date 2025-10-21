@@ -10,7 +10,7 @@ from pathlib import Path
 
 # Additional imports for RAG - CORRECTED IMPORTS
 import tiktoken
-from langchain_community.document_loaders import TextLoader
+#from langchain_community.document_loaders import TextLoader
 #from langchain.text_splitter import RecursiveCharacterTextSplitter
 #from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader  # CORRECTED LINE
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader

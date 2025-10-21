@@ -13,13 +13,13 @@ import tiktoken
 #from langchain_community.document_loaders import TextLoader
 #from langchain.text_splitter import RecursiveCharacterTextSplitter
 #from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader  # CORRECTED LINE
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+#from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 #from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
-from langchain_openai import OpenAIEmbeddings
+#from langchain_openai import OpenAIEmbeddings
 #from langchain.vectorstores import FAISS  # CORRECTED
-from langchain_community.vectorstores import FAISS
+#from langchain_community.vectorstores import FAISS
 #from langchain.schema import Document
-from langchain_core.documents import Document
+#from langchain_core.documents import Document
 
 # Page configuration
 st.set_page_config(

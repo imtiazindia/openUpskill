@@ -14,7 +14,8 @@ import tiktoken
 #from langchain.text_splitter import RecursiveCharacterTextSplitter
 #from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader  # CORRECTED LINE
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
-from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
+#from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
+from langchain_openai import OpenAIEmbeddings
 from langchain.vectorstores import FAISS  # CORRECTED
 from langchain.schema import Document
 

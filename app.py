@@ -1,25 +1,19 @@
-import streamlit as st
-import openai
-import time
-from datetime import datetime
 import os
-import tempfile
-import hashlib
+import time
 import json
-from pathlib import Path
-
-# Additional imports for RAG - CORRECTED IMPORTS
+import openai
+import hashlib
 import tiktoken
-#from langchain_community.document_loaders import TextLoader
-#from langchain.text_splitter import RecursiveCharacterTextSplitter
-#from langchain.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader  # CORRECTED LINE
-#from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
-#from langchain.embeddings.openai import OpenAIEmbeddings  # CORRECTED
-#from langchain_openai import OpenAIEmbeddings
-#from langchain.vectorstores import FAISS  # CORRECTED
-#from langchain_community.vectorstores import FAISS
-#from langchain.schema import Document
-#from langchain_core.documents import Document
+import tempfile
+import streamlit as st
+from datetime import datetime
+from pathlib import Path
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from docx2txt import process as docx2txt_process
 
 # Page configuration
 st.set_page_config(
@@ -90,19 +84,21 @@ def load_document(file_path, file_extension):
     try:
         if file_extension == '.pdf':
             loader = PyPDFLoader(file_path)
+            documents = loader.load()
         elif file_extension == '.txt':
             loader = TextLoader(file_path, encoding='utf-8')
+            documents = loader.load()
         elif file_extension in ['.docx', '.doc']:
-            loader = Docx2txtLoader(file_path)
+            text_content = docx2txt_process(file_path)
+            documents = [Document(page_content=text_content, metadata={"source": file_path})]
         else:
-            # For unsupported types, use text loader as fallback
             loader = TextLoader(file_path, encoding='utf-8')
+            documents = loader.load()
         
-        documents = loader.load()
         log_event("FILE_LOADED", f"Successfully loaded {len(documents)} pages from document")
         return documents
     except Exception as e:
-        log_event("FILE_ERROR", f"Error loading document", {"error": str(e)})
+        log_event("FILE_ERROR", "Error loading document", {"error": str(e)})
         return None
 
 def process_documents(api_key, uploaded_files):

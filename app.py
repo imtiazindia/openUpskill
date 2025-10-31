@@ -11,13 +11,42 @@ from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import PGVector
 from langchain_core.documents import Document
 from docx2txt import process as docx2txt_process
+import psycopg2
+from sqlalchemy import create_engine, text
+
+# Default OpenAI API Key (used automatically if present)
+# Priority: Streamlit secrets > Environment variable > Hardcoded default
+try:
+    DEFAULT_OPENAI_API_KEY = st.secrets.get("openai", {}).get("api_key", os.getenv("OPENAI_API_KEY", "sk-.."))
+except:
+    # Fallback if secrets.toml doesn't exist
+    DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-..")
+
+# PostgreSQL Configuration
+# Priority: Streamlit secrets > Environment variables > Defaults
+try:
+    DEFAULT_PG_HOST = st.secrets.get("postgres", {}).get("host", os.getenv("POSTGRES_HOST", "localhost"))
+    DEFAULT_PG_PORT = st.secrets.get("postgres", {}).get("port", os.getenv("POSTGRES_PORT", "5432"))
+    DEFAULT_PG_DATABASE = st.secrets.get("postgres", {}).get("database", os.getenv("POSTGRES_DB", "upskill_rag"))
+    DEFAULT_PG_USER = st.secrets.get("postgres", {}).get("user", os.getenv("POSTGRES_USER", "postgres"))
+    DEFAULT_PG_PASSWORD = st.secrets.get("postgres", {}).get("password", os.getenv("POSTGRES_PASSWORD", ""))
+except:
+    # Fallback if secrets.toml doesn't exist
+    DEFAULT_PG_HOST = os.getenv("POSTGRES_HOST", "localhost")
+    DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5432")
+    DEFAULT_PG_DATABASE = os.getenv("POSTGRES_DB", "upskill_rag")
+    DEFAULT_PG_USER = os.getenv("POSTGRES_USER", "postgres")
+    DEFAULT_PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+
+# PGVector collection name
+COLLECTION_NAME = "upskill_documents"
 
 # Page configuration
 st.set_page_config(
-    page_title="Ask upSkill Air",
+    page_title="Ask UpskillAir",
     page_icon="🤖",
     layout="wide"
 )
@@ -79,6 +108,105 @@ def count_tokens(text):
     encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
 
+def get_pg_connection_string(host, port, database, user, password):
+    """Create PostgreSQL connection string"""
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+
+def test_postgres_connection(connection_string):
+    """Test PostgreSQL connection and initialize pgvector extension"""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            # Check connection
+            conn.execute(text("SELECT 1"))
+            
+            # Create pgvector extension if it doesn't exist
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.commit()
+            
+        return True, "PostgreSQL connection successful and pgvector extension initialized"
+    except Exception as e:
+        return False, f"PostgreSQL connection failed: {str(e)}"
+
+def get_vector_store(connection_string, api_key, create_new=False):
+    """Get or create PGVector store"""
+    try:
+        embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        
+        if create_new:
+            # This will create the collection if it doesn't exist
+            vector_store = PGVector(
+                connection_string=connection_string,
+                embedding_function=embeddings,
+                collection_name=COLLECTION_NAME,
+            )
+        else:
+            # Connect to existing collection
+            vector_store = PGVector(
+                connection_string=connection_string,
+                embedding_function=embeddings,
+                collection_name=COLLECTION_NAME,
+            )
+        
+        return vector_store, None
+    except Exception as e:
+        return None, str(e)
+
+def get_stored_documents(connection_string):
+    """Retrieve list of stored documents from metadata"""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            # Query the langchain_pg_embedding table for unique documents
+            result = conn.execute(text(f"""
+                SELECT DISTINCT 
+                    cmetadata->>'file_name' as file_name,
+                    cmetadata->>'file_hash' as file_hash,
+                    cmetadata->>'file_size' as file_size,
+                    cmetadata->>'upload_time' as upload_time
+                FROM langchain_pg_embedding
+                WHERE collection_id = (
+                    SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name
+                )
+                AND cmetadata->>'file_name' IS NOT NULL
+                ORDER BY cmetadata->>'upload_time' DESC
+            """), {"collection_name": COLLECTION_NAME})
+            
+            documents = []
+            for row in result:
+                if row[0]:  # file_name exists
+                    documents.append({
+                        "name": row[0],
+                        "hash": row[1],
+                        "size": int(row[2]) if row[2] else 0,
+                        "upload_time": row[3]
+                    })
+            
+            return documents
+    except Exception as e:
+        log_event("DB_ERROR", "Error retrieving stored documents", {"error": str(e)})
+        return []
+
+def clear_vector_store(connection_string):
+    """Clear all documents from the vector store"""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            # Delete all embeddings for this collection
+            conn.execute(text(f"""
+                DELETE FROM langchain_pg_embedding
+                WHERE collection_id = (
+                    SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name
+                )
+            """), {"collection_name": COLLECTION_NAME})
+            conn.commit()
+        
+        log_event("DB_CLEARED", "Vector store cleared successfully")
+        return True
+    except Exception as e:
+        log_event("DB_ERROR", "Error clearing vector store", {"error": str(e)})
+        return False
+
 def load_document(file_path, file_extension):
     """Load document based on file type"""
     try:
@@ -101,11 +229,19 @@ def load_document(file_path, file_extension):
         log_event("FILE_ERROR", "Error loading document", {"error": str(e)})
         return None
 
-def process_documents(api_key, uploaded_files):
-    """Process uploaded documents for RAG"""
+def process_documents(api_key, uploaded_files, connection_string):
+    """Process uploaded documents for RAG with PostgreSQL storage"""
     if not api_key:
         log_event("PROCESSING_ERROR", "No API key provided")
         return False
+    
+    if not connection_string:
+        log_event("PROCESSING_ERROR", "No database connection string provided")
+        return False
+    
+    # Get existing documents from database
+    existing_docs = get_stored_documents(connection_string)
+    existing_hashes = {doc['hash'] for doc in existing_docs}
     
     all_documents = []
     processed_files = []
@@ -117,10 +253,12 @@ def process_documents(api_key, uploaded_files):
     
     for i, uploaded_file in enumerate(uploaded_files):
         try:
-            # Check for duplicates
+            # Check for duplicates in database
             file_hash = calculate_file_hash(uploaded_file.getvalue())
-            if any(doc.get('hash') == file_hash for doc in st.session_state.documents_processed):
-                log_event("DUPLICATE_SKIPPED", f"Skipped duplicate file: {uploaded_file.name}")
+            if file_hash in existing_hashes:
+                log_event("DUPLICATE_SKIPPED", f"Skipped duplicate file (already in database): {uploaded_file.name}")
+                status_text.text(f"Skipping {uploaded_file.name} (already in database)... ({i+1}/{len(uploaded_files)})")
+                time.sleep(0.5)
                 continue
             
             status_text.text(f"Processing {uploaded_file.name}... ({i+1}/{len(uploaded_files)})")
@@ -147,7 +285,6 @@ def process_documents(api_key, uploaded_files):
                     "file_hash": file_hash,
                     "file_size": uploaded_file.size,
                     "upload_time": datetime.now().isoformat(),
-                    "processed_by_api": api_key[:10] + "..."  # Track which API key processed this
                 })
             
             all_documents.extend(documents)
@@ -159,9 +296,7 @@ def process_documents(api_key, uploaded_files):
                 "size": uploaded_file.size,
                 "pages": len(documents),
                 "processed_at": datetime.now().isoformat(),
-                "api_key_owner": api_key[:10] + "..."  # Restrict to this API key
             }
-            st.session_state.documents_processed.append(processed_file_info)
             processed_files.append(processed_file_info)
             
             log_event("FILE_PROCESSED", f"Processed {uploaded_file.name}", {
@@ -175,8 +310,11 @@ def process_documents(api_key, uploaded_files):
         progress_bar.progress((i + 1) / len(uploaded_files))
     
     if not all_documents:
-        log_event("PROCESSING_ERROR", "No documents were successfully processed")
-        return False
+        log_event("PROCESSING_INFO", "No new documents to process")
+        progress_bar.empty()
+        status_text.empty()
+        # Still initialize RAG with existing documents
+        return init_rag_from_db(api_key, connection_string)
     
     # Chunk documents
     status_text.text("Chunking documents...")
@@ -194,42 +332,78 @@ def process_documents(api_key, uploaded_files):
     total_chunks = len(chunks)
     avg_chunk_size = sum(count_tokens(chunk.page_content) for chunk in chunks) / total_chunks if total_chunks > 0 else 0
     
-    st.session_state.chunking_stats = {
+    log_event("CHUNKING_COMPLETE", "Document chunking completed", {
         "total_documents": len(all_documents),
         "total_chunks": total_chunks,
-        "avg_chunk_size": avg_chunk_size,
-        "chunking_time": datetime.now().isoformat(),
-        "processed_files": processed_files
-    }
+        "avg_chunk_size": avg_chunk_size
+    })
     
-    log_event("CHUNKING_COMPLETE", "Document chunking completed", st.session_state.chunking_stats)
-    
-    # Create vector store
-    status_text.text("Creating vector embeddings...")
-    log_event("EMBEDDING_START", "Starting vector embedding creation")
+    # Store in PostgreSQL vector store
+    status_text.text("Storing vector embeddings in PostgreSQL...")
+    log_event("EMBEDDING_START", "Starting vector embedding creation and storage")
     
     try:
         embeddings = OpenAIEmbeddings(openai_api_key=api_key)
-        vector_store = FAISS.from_documents(chunks, embeddings)
+        
+        # Get or create vector store
+        if st.session_state.vector_store is None:
+            # Create new vector store
+            vector_store = PGVector.from_documents(
+                documents=chunks,
+                embedding=embeddings,
+                collection_name=COLLECTION_NAME,
+                connection_string=connection_string,
+            )
+        else:
+            # Add to existing vector store
+            vector_store = st.session_state.vector_store
+            vector_store.add_documents(chunks)
+        
         st.session_state.vector_store = vector_store
         st.session_state.rag_initialized = True
         
-        log_event("RAG_INITIALIZED", "RAG system successfully initialized", {
-            "total_chunks": total_chunks,
-            "documents_processed": len(processed_files),
-            "api_key_restricted": True
+        # Update documents processed list with all stored docs
+        st.session_state.documents_processed = get_stored_documents(connection_string)
+        
+        log_event("RAG_INITIALIZED", "Documents stored in PostgreSQL successfully", {
+            "new_chunks": total_chunks,
+            "new_documents": len(processed_files),
+            "total_documents_in_db": len(st.session_state.documents_processed)
         })
         
-        status_text.text("RAG system ready!")
+        status_text.text("Documents stored successfully!")
         time.sleep(1)
         progress_bar.empty()
         status_text.empty()
         return True
         
     except Exception as e:
-        log_event("EMBEDDING_ERROR", "Error creating embeddings", {"error": str(e)})
+        log_event("EMBEDDING_ERROR", "Error creating/storing embeddings", {"error": str(e)})
         progress_bar.empty()
         status_text.empty()
+        return False
+
+def init_rag_from_db(api_key, connection_string):
+    """Initialize RAG system from existing PostgreSQL data"""
+    try:
+        vector_store, error = get_vector_store(connection_string, api_key)
+        if error:
+            log_event("RAG_INIT_ERROR", "Error connecting to vector store", {"error": error})
+            return False
+        
+        st.session_state.vector_store = vector_store
+        st.session_state.rag_initialized = True
+        
+        # Load document metadata
+        st.session_state.documents_processed = get_stored_documents(connection_string)
+        
+        log_event("RAG_INITIALIZED", "RAG system initialized from PostgreSQL", {
+            "documents_in_db": len(st.session_state.documents_processed)
+        })
+        
+        return True
+    except Exception as e:
+        log_event("RAG_INIT_ERROR", "Error initializing RAG from database", {"error": str(e)})
         return False
 
 def rag_query(question, api_key, max_results=3):
@@ -287,16 +461,17 @@ def rag_query(question, api_key, max_results=3):
         return None, []
 
 def main():
-    st.title("upSkill Air Learning Assistant")
+    st.title("UpskillAir Learning Assistant")
     st.markdown("---")
     
-    # Sidebar for API configuration
+    # Sidebar for configuration
     with st.sidebar:
         st.header("🔑 API Configuration")
         api_key = st.text_input(
             "Enter your OpenAI API Key:",
             type="password",
             placeholder="sk-...",
+            value=DEFAULT_OPENAI_API_KEY,
             help="Get your API key from https://platform.openai.com/api-keys"
         )
         
@@ -329,43 +504,97 @@ def main():
         
         st.markdown("---")
         
-        # RAG Document Upload Section
-        st.header("📁 RAG Document Setup")
+        # PostgreSQL Configuration
+        st.header("🗄️ PostgreSQL Configuration")
         
-        if st.session_state.get('connected', False):
+        with st.expander("Database Settings", expanded=False):
+            pg_host = st.text_input("Host", value=DEFAULT_PG_HOST, help="PostgreSQL host address")
+            pg_port = st.text_input("Port", value=DEFAULT_PG_PORT, help="PostgreSQL port")
+            pg_database = st.text_input("Database", value=DEFAULT_PG_DATABASE, help="Database name")
+            pg_user = st.text_input("User", value=DEFAULT_PG_USER, help="Database user")
+            pg_password = st.text_input("Password", type="password", value=DEFAULT_PG_PASSWORD, help="Database password")
+        
+        # Create connection string
+        connection_string = get_pg_connection_string(pg_host, pg_port, pg_database, pg_user, pg_password)
+        
+        # Test PostgreSQL connection
+        if st.button("Test PostgreSQL Connection"):
+            with st.spinner("Testing PostgreSQL connection..."):
+                pg_success, pg_msg = test_postgres_connection(connection_string)
+                if pg_success:
+                    st.success(pg_msg)
+                    st.session_state.pg_connected = True
+                    st.session_state.connection_string = connection_string
+                else:
+                    st.error(pg_msg)
+                    st.session_state.pg_connected = False
+        
+        # Show connection status
+        if st.session_state.get('pg_connected', False):
+            st.success("✅ PostgreSQL Connected")
+            st.session_state.connection_string = connection_string
+        else:
+            st.warning("⚠️ PostgreSQL Not Connected")
+        
+        st.markdown("---")
+        
+        # RAG Document Upload Section
+        st.header("📁 RAG Document Management")
+        
+        # Initialize RAG from database on first connection
+        if (st.session_state.get('connected', False) and 
+            st.session_state.get('pg_connected', False) and 
+            not st.session_state.get('rag_initialized', False)):
+            
+            with st.spinner("Loading existing documents from database..."):
+                if init_rag_from_db(api_key, connection_string):
+                    if len(st.session_state.documents_processed) > 0:
+                        st.success(f"✅ Loaded {len(st.session_state.documents_processed)} documents from database")
+        
+        if st.session_state.get('connected', False) and st.session_state.get('pg_connected', False):
             uploaded_files = st.file_uploader(
-                "Choose documents for RAG",
+                "Upload New Documents",
                 type=['pdf', 'txt', 'docx', 'doc'],
                 accept_multiple_files=True,
-                help="Upload PDF, TXT, or DOCX files to build your knowledge base"
+                help="Upload PDF, TXT, or DOCX files. Duplicates will be automatically skipped."
             )
             
             if uploaded_files:
-                if st.button("Process Documents for RAG"):
+                if st.button("Process & Store Documents"):
                     with st.spinner("Processing documents..."):
-                        success = process_documents(api_key, uploaded_files)
+                        success = process_documents(api_key, uploaded_files, connection_string)
                         if success:
-                            st.success("✅ RAG system initialized successfully!")
+                            st.success("✅ Documents stored in PostgreSQL successfully!")
+                            st.rerun()
                         else:
-                            st.error("❌ Error initializing RAG system")
+                            st.error("❌ Error processing documents")
             
-            # Display processed documents
+            # Display stored documents from database
             if st.session_state.documents_processed:
-                st.subheader("Processed Documents")
+                st.subheader(f"📚 Stored Documents ({len(st.session_state.documents_processed)})")
                 for doc in st.session_state.documents_processed:
                     st.write(f"📄 {doc['name']} ({doc['size']} bytes)")
             
-            # Clear RAG data button
-            if st.session_state.rag_initialized and st.button("Clear RAG Data"):
-                st.session_state.rag_initialized = False
-                st.session_state.vector_store = None
-                st.session_state.documents_processed = []
-                st.session_state.chunking_stats = {}
-                log_event("RAG_CLEARED", "RAG data cleared by user")
-                st.rerun()
+            # Clear database button
+            if st.session_state.rag_initialized:
+                st.markdown("---")
+                if st.button("🗑️ Clear All Documents from Database", type="secondary"):
+                    if clear_vector_store(connection_string):
+                        st.session_state.rag_initialized = False
+                        st.session_state.vector_store = None
+                        st.session_state.documents_processed = []
+                        st.session_state.chunking_stats = {}
+                        st.success("✅ Database cleared successfully!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Error clearing database")
                 
         else:
-            st.info("🔑 Connect to OpenAI first to enable RAG features")
+            if not st.session_state.get('connected', False):
+                st.info("🔑 Connect to OpenAI first")
+            if not st.session_state.get('pg_connected', False):
+                st.info("🗄️ Connect to PostgreSQL to enable document storage")
     
     # Main content area
     col1, col2 = st.columns([2, 1])
@@ -467,33 +696,35 @@ def main():
         
         if st.session_state.get('connected', False):
             st.success("✅ Connected to OpenAI")
-            st.metric("Connection Status", "Active")
+            st.metric("OpenAI Status", "Active")
+            
+            # PostgreSQL Status
+            if st.session_state.get('pg_connected', False):
+                st.success("✅ Connected to PostgreSQL")
+                st.metric("PostgreSQL Status", "Active")
+            else:
+                st.warning("⚠️ PostgreSQL Disconnected")
             
             # RAG Status Section
             st.subheader("🦙 RAG Status")
             if st.session_state.rag_initialized:
-                st.success(f"✅ RAG System Active, {len(st.session_state.documents_processed)} documents loaded")
-                st.metric("Documents Loaded", len(st.session_state.documents_processed))
-                if st.session_state.chunking_stats:
-                    st.metric("Total Chunks", st.session_state.chunking_stats.get('total_chunks', 0))
+                doc_count = len(st.session_state.documents_processed)
+                st.success(f"✅ RAG System Active")
+                st.metric("Documents in Database", doc_count)
+                st.info("💾 Using PostgreSQL persistent storage")
             else:
                 st.warning("⚠️ RAG System Inactive")
             
-            # Processing Statistics
-            if st.session_state.chunking_stats:
-                st.subheader("📈 Processing Statistics")
-                stats = st.session_state.chunking_stats
-                st.write(f"**Total Documents:** {stats.get('total_documents', 0)}")
-                st.write(f"**Total Chunks:** {stats.get('total_chunks', 0)}")
-                st.write(f"**Avg Chunk Size:** {stats.get('avg_chunk_size', 0):.1f} tokens")
-                st.write(f"**Last Processed:** {stats.get('chunking_time', 'Never')}")
-            
             # Display connection details
             st.subheader("🔗 Connection Details")
-            st.write(f"**Last Test:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            st.write(f"**Last Check:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             st.write(f"**API Key:** `{st.session_state.api_key[:10]}...`")
-            st.write("**Service:** OpenAI API")
-            st.write("**Status:** Operational")
+            st.write("**OpenAI Service:** Operational")
+            if st.session_state.get('pg_connected', False):
+                st.write("**PostgreSQL:** Connected")
+                st.write(f"**Database:** {DEFAULT_PG_DATABASE}")
+            else:
+                st.write("**PostgreSQL:** Not Connected")
             
             # Chat statistics
             if st.session_state.messages:

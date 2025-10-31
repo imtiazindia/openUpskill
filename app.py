@@ -48,7 +48,8 @@ COLLECTION_NAME = "upskill_documents"
 st.set_page_config(
     page_title="Ask UpskillAir",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 # Initialize session state for RAG
@@ -62,6 +63,12 @@ if 'processing_logs' not in st.session_state:
     st.session_state.processing_logs = []
 if 'chunking_stats' not in st.session_state:
     st.session_state.chunking_stats = {}
+if 'auto_load_attempted' not in st.session_state:
+    st.session_state.auto_load_attempted = False
+if 'connected' not in st.session_state:
+    st.session_state.connected = False
+if 'pg_connected' not in st.session_state:
+    st.session_state.pg_connected = False
 
 def log_event(event_type, message, details=None):
     """Comprehensive logging function"""
@@ -158,8 +165,9 @@ def get_stored_documents(connection_string):
         engine = create_engine(connection_string)
         with engine.connect() as conn:
             # Query the langchain_pg_embedding table for unique documents
-            result = conn.execute(text(f"""
-                SELECT DISTINCT 
+            # Group by file_hash to ensure we only get unique files
+            result = conn.execute(text("""
+                SELECT DISTINCT ON (cmetadata->>'file_hash')
                     cmetadata->>'file_name' as file_name,
                     cmetadata->>'file_hash' as file_hash,
                     cmetadata->>'file_size' as file_size,
@@ -169,15 +177,21 @@ def get_stored_documents(connection_string):
                     SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name
                 )
                 AND cmetadata->>'file_name' IS NOT NULL
-                ORDER BY cmetadata->>'upload_time' DESC
+                AND cmetadata->>'file_hash' IS NOT NULL
+                ORDER BY cmetadata->>'file_hash', cmetadata->>'upload_time' DESC
             """), {"collection_name": COLLECTION_NAME})
             
             documents = []
+            seen_hashes = set()
+            
             for row in result:
-                if row[0]:  # file_name exists
+                file_hash = row[1]
+                # Double-check for duplicates
+                if row[0] and file_hash and file_hash not in seen_hashes:
+                    seen_hashes.add(file_hash)
                     documents.append({
                         "name": row[0],
-                        "hash": row[1],
+                        "hash": file_hash,
                         "size": int(row[2]) if row[2] else 0,
                         "upload_time": row[3]
                     })
@@ -186,6 +200,71 @@ def get_stored_documents(connection_string):
     except Exception as e:
         log_event("DB_ERROR", "Error retrieving stored documents", {"error": str(e)})
         return []
+
+def count_duplicate_vectors(connection_string):
+    """Count how many duplicate vectors exist in the database"""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as duplicate_count
+                FROM (
+                    SELECT cmetadata->>'file_hash' as file_hash,
+                           COUNT(*) as count
+                    FROM langchain_pg_embedding
+                    WHERE collection_id = (
+                        SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name
+                    )
+                    AND cmetadata->>'file_hash' IS NOT NULL
+                    GROUP BY cmetadata->>'file_hash'
+                    HAVING COUNT(*) > 1
+                ) duplicates
+            """), {"collection_name": COLLECTION_NAME})
+            
+            row = result.fetchone()
+            return row[0] if row else 0
+            
+    except Exception as e:
+        log_event("DB_ERROR", "Error counting duplicates", {"error": str(e)})
+        return 0
+
+def remove_duplicate_vectors(connection_string):
+    """Remove duplicate vectors from the database based on file_hash"""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            # Find and delete duplicate embeddings, keeping only the most recent one for each file_hash
+            result = conn.execute(text("""
+                DELETE FROM langchain_pg_embedding
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY cmetadata->>'file_hash' 
+                                   ORDER BY cmetadata->>'upload_time' DESC
+                               ) AS rn
+                        FROM langchain_pg_embedding
+                        WHERE collection_id = (
+                            SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name
+                        )
+                        AND cmetadata->>'file_hash' IS NOT NULL
+                    ) t
+                    WHERE t.rn > 1
+                )
+                RETURNING cmetadata->>'file_name'
+            """), {"collection_name": COLLECTION_NAME})
+            
+            deleted_count = result.rowcount
+            conn.commit()
+            
+            if deleted_count > 0:
+                log_event("DUPLICATES_REMOVED", f"Removed {deleted_count} duplicate vector entries")
+                return deleted_count
+            return 0
+            
+    except Exception as e:
+        log_event("DB_ERROR", "Error removing duplicates", {"error": str(e)})
+        return 0
 
 def clear_vector_store(connection_string):
     """Clear all documents from the vector store"""
@@ -241,32 +320,47 @@ def process_documents(api_key, uploaded_files, connection_string):
     
     # Get existing documents from database
     existing_docs = get_stored_documents(connection_string)
-    existing_hashes = {doc['hash'] for doc in existing_docs}
+    existing_hashes = {doc['hash'] for doc in existing_docs if doc.get('hash')}  # Filter out None/empty hashes
     
     all_documents = []
     processed_files = []
     
     log_event("PROCESSING_START", f"Starting processing of {len(uploaded_files)} files")
+    log_event("DUPLICATE_CHECK", f"Found {len(existing_hashes)} unique documents in database")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, uploaded_file in enumerate(uploaded_files):
         try:
+            # Calculate file hash for duplicate detection
+            file_content = uploaded_file.getvalue()
+            file_hash = calculate_file_hash(file_content)
+            
+            # Verify hash is valid
+            if not file_hash:
+                log_event("PROCESSING_ERROR", f"Failed to generate hash for {uploaded_file.name}")
+                continue
+            
             # Check for duplicates in database
-            file_hash = calculate_file_hash(uploaded_file.getvalue())
             if file_hash in existing_hashes:
-                log_event("DUPLICATE_SKIPPED", f"Skipped duplicate file (already in database): {uploaded_file.name}")
-                status_text.text(f"Skipping {uploaded_file.name} (already in database)... ({i+1}/{len(uploaded_files)})")
+                log_event("DUPLICATE_SKIPPED", f"Skipped duplicate file (hash match): {uploaded_file.name}", {
+                    "hash": file_hash,
+                    "file": uploaded_file.name
+                })
+                status_text.text(f"⏭️ Skipping {uploaded_file.name} (already in database)... ({i+1}/{len(uploaded_files)})")
                 time.sleep(0.5)
                 continue
             
+            # Add to existing hashes to prevent duplicates within this batch
+            existing_hashes.add(file_hash)
+            
             status_text.text(f"Processing {uploaded_file.name}... ({i+1}/{len(uploaded_files)})")
             
-            # Save file temporarily
+            # Save file temporarily (use already-read content)
             file_extension = Path(uploaded_file.name).suffix.lower()
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
+                tmp_file.write(file_content)
                 tmp_file_path = tmp_file.name
             
             # Load document
@@ -460,9 +554,61 @@ def rag_query(question, api_key, max_results=3):
         log_event("RAG_ERROR", "Error processing RAG query", {"error": str(e)})
         return None, []
 
+def auto_load_rag_from_db(api_key, connection_string):
+    """Automatically load RAG documents from database on startup"""
+    if st.session_state.auto_load_attempted:
+        return  # Only try once per session
+    
+    st.session_state.auto_load_attempted = True
+    
+    try:
+        # Test OpenAI connection
+        connection_success, connection_msg, model_count = test_connection(api_key)
+        if connection_success:
+            st.session_state.connected = True
+            st.session_state.api_key = api_key
+            log_event("AUTO_CONNECT_OPENAI", "OpenAI connected automatically")
+        else:
+            log_event("AUTO_LOAD_SKIPPED", "OpenAI connection failed", {"error": connection_msg})
+            return
+        
+        # Test PostgreSQL connection
+        pg_success, pg_msg = test_postgres_connection(connection_string)
+        if not pg_success:
+            log_event("AUTO_LOAD_SKIPPED", "PostgreSQL connection failed", {"error": pg_msg})
+            return
+        
+        # Mark PostgreSQL as connected
+        st.session_state.pg_connected = True
+        st.session_state.connection_string = connection_string
+        log_event("AUTO_CONNECT_POSTGRES", "PostgreSQL connected automatically")
+        
+        # Initialize RAG from database
+        with st.spinner("🔄 Loading documents from database..."):
+            if init_rag_from_db(api_key, connection_string):
+                if len(st.session_state.documents_processed) > 0:
+                    # st.success(f"✅ Auto-loaded {len(st.session_state.documents_processed)} documents from database")
+                    log_event("AUTO_LOAD_SUCCESS", f"Automatically loaded {len(st.session_state.documents_processed)} documents")
+                else:
+                    st.info("ℹ️ Database connected but empty. Upload documents to get started.")
+                    log_event("AUTO_LOAD_INFO", "Database is empty")
+            else:
+                log_event("AUTO_LOAD_FAILED", "Failed to initialize RAG from database")
+    except Exception as e:
+        log_event("AUTO_LOAD_ERROR", "Error during auto-load", {"error": str(e)})
+
 def main():
     st.title("UpskillAir Learning Assistant")
     st.markdown("---")
+    
+    # Auto-load RAG documents from database on startup
+    if DEFAULT_OPENAI_API_KEY and DEFAULT_OPENAI_API_KEY.startswith('sk-'):
+        connection_string = get_pg_connection_string(
+            DEFAULT_PG_HOST, DEFAULT_PG_PORT, DEFAULT_PG_DATABASE, 
+            DEFAULT_PG_USER, DEFAULT_PG_PASSWORD
+        )
+        if not st.session_state.auto_load_attempted:
+            auto_load_rag_from_db(DEFAULT_OPENAI_API_KEY, connection_string)
     
     # Sidebar for configuration
     with st.sidebar:
@@ -525,6 +671,14 @@ def main():
                     st.success(pg_msg)
                     st.session_state.pg_connected = True
                     st.session_state.connection_string = connection_string
+                    
+                    # Auto-load documents from database if not already loaded
+                    if not st.session_state.rag_initialized and st.session_state.get('connected', False):
+                        with st.spinner("Loading existing documents from database..."):
+                            if init_rag_from_db(api_key, connection_string):
+                                if len(st.session_state.documents_processed) > 0:
+                                    st.success(f"✅ Loaded {len(st.session_state.documents_processed)} documents from database")
+                                    st.rerun()
                 else:
                     st.error(pg_msg)
                     st.session_state.pg_connected = False
@@ -540,16 +694,6 @@ def main():
         
         # RAG Document Upload Section
         st.header("📁 RAG Document Management")
-        
-        # Initialize RAG from database on first connection
-        if (st.session_state.get('connected', False) and 
-            st.session_state.get('pg_connected', False) and 
-            not st.session_state.get('rag_initialized', False)):
-            
-            with st.spinner("Loading existing documents from database..."):
-                if init_rag_from_db(api_key, connection_string):
-                    if len(st.session_state.documents_processed) > 0:
-                        st.success(f"✅ Loaded {len(st.session_state.documents_processed)} documents from database")
         
         if st.session_state.get('connected', False) and st.session_state.get('pg_connected', False):
             uploaded_files = st.file_uploader(
@@ -575,10 +719,33 @@ def main():
                 for doc in st.session_state.documents_processed:
                     st.write(f"📄 {doc['name']} ({doc['size']} bytes)")
             
-            # Clear database button
+            # Database management buttons
             if st.session_state.rag_initialized:
                 st.markdown("---")
-                if st.button("🗑️ Clear All Documents from Database", type="secondary"):
+                st.subheader("🔧 Database Management")
+                
+                # Check for duplicates
+                duplicate_count = count_duplicate_vectors(connection_string)
+                if duplicate_count > 0:
+                    st.warning(f"⚠️ {duplicate_count} file(s) have duplicate vectors")
+                
+                # Remove duplicates button
+                remove_button_text = f"🧹 Remove Duplicates ({duplicate_count})" if duplicate_count > 0 else "🧹 Remove Duplicates"
+                if st.button(remove_button_text, use_container_width=True, disabled=(duplicate_count == 0)):
+                    with st.spinner("Removing duplicates..."):
+                        deleted_count = remove_duplicate_vectors(connection_string)
+                        if deleted_count > 0:
+                            st.success(f"✅ Removed {deleted_count} duplicate vector entries!")
+                            # Refresh document list
+                            st.session_state.documents_processed = get_stored_documents(connection_string)
+                            log_event("DUPLICATES_CLEANED", f"User cleaned {deleted_count} duplicates")
+                            time.sleep(1.5)
+                            st.rerun()
+                        else:
+                            st.info("✨ No duplicates found!")
+                
+                # Clear all button
+                if st.button("🗑️ Clear All Documents", type="secondary", use_container_width=True):
                     if clear_vector_store(connection_string):
                         st.session_state.rag_initialized = False
                         st.session_state.vector_store = None
@@ -596,170 +763,284 @@ def main():
             if not st.session_state.get('pg_connected', False):
                 st.info("🗄️ Connect to PostgreSQL to enable document storage")
     
+    # Initialize collapsible state
+    if 'show_status_panel' not in st.session_state:
+        st.session_state.show_status_panel = False
+    
     # Main content area
-    col1, col2 = st.columns([2, 1])
+    if st.session_state.show_status_panel:
+        col1, col2 = st.columns([2, 1])
+    else:
+        col1 = st.container()
+        col2 = None
     
     with col1:
-        st.header("💬 Type your questions below")
+        # Header with toggle button
+        header_col1, header_col2 = st.columns([5, 1])
+        with header_col1:
+            st.header("💬 Chat Interface")
+        with header_col2:
+            # Toggle button for status panel
+            if st.session_state.show_status_panel:
+                if st.button("◀️", help="Hide Status Panel", use_container_width=True):
+                    st.session_state.show_status_panel = False
+                    st.rerun()
+            else:
+                if st.button("▶️", help="Show Status Panel", use_container_width=True):
+                    st.session_state.show_status_panel = True
+                    st.rerun()
         
-        if st.session_state.get('connected', False):
+        # Check if both connections are valid
+        connections_valid = (
+            st.session_state.get('connected', False) and 
+            st.session_state.get('pg_connected', False)
+        )
+        
+        if not connections_valid:
+            # Show connection requirements
+            st.info("🔌 **Please establish connections to start chatting**")
+            
+            if not st.session_state.get('connected', False):
+                st.warning("❌ OpenAI API connection required")
+                st.markdown("👉 Open the sidebar and enter your OpenAI API key")
+            
+            if not st.session_state.get('pg_connected', False):
+                st.warning("❌ PostgreSQL connection required")
+                st.markdown("👉 Open the sidebar and configure PostgreSQL connection")
+            
+            # Show helpful message
+            st.markdown("---")
+            st.markdown("""
+            ### 🚀 Quick Start Guide
+            
+            1. **Click the arrow (▶️) on the left** to open the sidebar
+            2. **Enter your OpenAI API Key** and wait for validation
+            3. **Configure PostgreSQL** (or use default Docker settings)
+            4. **Click "Test PostgreSQL Connection"**
+            5. **Upload documents** (optional - chat works without documents too)
+            6. **Start chatting!**
+            """)
+            
+        else:
+            # Connections valid - show chat interface
             # Initialize chat history
             if 'messages' not in st.session_state:
                 st.session_state.messages = []
             
-            # Display RAG status
-            #if st.session_state.rag_initialized:
-               #st.success(".")
-                # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
-            #else:
-               # st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
-
-            #if st.session_state.rag_initialized:
-               #st.warning("⚠️ RAG Not Active - Upload documents to enable context-aware responses")
-                #st.success(".")
-                # st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded")
-            #else:
+            # Add CSS to prevent layout shifts and style toggle button
+            st.markdown("""
+                <style>
+                /* Prevent layout shifts during reruns */
+                .stChatMessage {
+                    animation: none !important;
+                }
                 
+                /* Stable container heights */
+                section[data-testid="stVerticalBlock"] > div {
+                    transition: none !important;
+                }
+                
+                /* Remove transition effects that cause flicker */
+                .element-container {
+                    transition: none !important;
+                }
+                
+                /* Style toggle button */
+                div[data-testid="column"]:has(button[title*="Status Panel"]) {
+                    display: flex;
+                    align-items: center;
+                    justify-content: flex-end;
+                }
+                </style>
+            """, unsafe_allow_html=True)
             
-            # Display chat messages
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-                    if message.get("sources"):
-                        with st.expander("📎 View Sources"):
-                            for i, source in enumerate(message["sources"]):
-                                st.write(f"**Source {i+1}:** {source.metadata.get('file_name', 'Unknown')}")
-                                st.write(f"**Content Preview:** {source.page_content[:200]}...")
+            # Display RAG status indicator (compact)
+            if st.session_state.rag_initialized and len(st.session_state.documents_processed) > 0:
+                st.success(f"✅ RAG Active - {len(st.session_state.documents_processed)} documents loaded from database")
+                
+                # Display loaded documents for context awareness
+                with st.expander("📚 Loaded Documents - Click to view", expanded=False):
+                    st.caption(f"You can ask questions about these {len(st.session_state.documents_processed)} documents:")
+                    for idx, doc in enumerate(st.session_state.documents_processed, 1):
+                        col_doc1, col_doc2 = st.columns([4, 1])
+                        with col_doc1:
+                            st.write(f"**{idx}.** 📄 {doc['name']}")
+                        with col_doc2:
+                            # Format file size
+                            size_kb = doc['size'] / 1024
+                            if size_kb < 1024:
+                                st.caption(f"{size_kb:.1f} KB")
+                            else:
+                                st.caption(f"{size_kb/1024:.1f} MB")
+                    
+                    # Show upload time for most recent document
+                    if st.session_state.documents_processed:
+                        latest_doc = st.session_state.documents_processed[0]
+                        if latest_doc.get('upload_time'):
+                            st.caption(f"💾 Stored in PostgreSQL database")
+            elif st.session_state.rag_initialized:
+                st.info("ℹ️ RAG Ready - Upload documents to enable context-aware responses")
             
-            # Chat input
+            # Create a stable container for chat messages
+            chat_container = st.container()
+            
+            with chat_container:
+                # Display chat messages
+                for message in st.session_state.messages:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+                        if message.get("sources"):
+                            with st.expander("📎 View Sources"):
+                                for i, source in enumerate(message["sources"]):
+                                    st.write(f"**Source {i+1}:** {source.metadata.get('file_name', 'Unknown')}")
+                                    st.write(f"**Content Preview:** {source.page_content[:200]}...")
+            
+            # Clear chat button (before input to prevent layout shift)
+            button_col1, button_col2 = st.columns([6, 1])
+            with button_col2:
+                if st.session_state.messages:
+                    if st.button("🗑️ Clear", use_container_width=True):
+                        st.session_state.messages = []
+                        st.rerun()
+            
+            # Chat input (fixed at bottom)
             if prompt := st.chat_input("Ask me anything..."):
                 # Add user message to chat history
                 st.session_state.messages.append({"role": "user", "content": prompt})
-                with st.chat_message("user"):
-                    st.markdown(prompt)
                 
-                # Generate AI response
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        try:
-                            if st.session_state.rag_initialized:
-                                # Use RAG for response
-                                answer, sources = rag_query(prompt, st.session_state.api_key)
-                                if answer:
-                                    st.markdown(answer)
-                                    if sources:
-                                        with st.expander("📎 View Sources"):
-                                            for i, source in enumerate(sources):
-                                                st.write(f"**Source {i+1}:** {source.metadata.get('file_name', 'Unknown')}")
-                                                st.write(f"**Content Preview:** {source.page_content[:200]}...")
-                                    
-                                    # Add assistant response to chat history with sources
-                                    st.session_state.messages.append({
-                                        "role": "assistant", 
-                                        "content": answer,
-                                        "sources": sources
-                                    })
-                                else:
-                                    st.error("Error generating RAG response")
-                            else:
-                                # Regular chat without RAG
-                                client = openai.OpenAI(api_key=st.session_state.api_key)
-                                
-                                # Create completion with streaming
-                                stream = client.chat.completions.create(
-                                    model="gpt-3.5-turbo",
-                                    messages=[
-                                        {"role": m["role"], "content": m["content"]}
-                                        for m in st.session_state.messages
-                                    ],
-                                    stream=True,
-                                )
-                                
-                                response = st.write_stream(stream)
-                                
-                                # Add assistant response to chat history
-                                st.session_state.messages.append({"role": "assistant", "content": response})
-                                
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
-            
-            # Clear chat button
-            if st.button("Clear Chat"):
-                st.session_state.messages = []
+                # Generate AI response (without showing spinner in UI to prevent flicker)
+                try:
+                    if st.session_state.rag_initialized:
+                        # Use RAG for response
+                        answer, sources = rag_query(prompt, st.session_state.api_key)
+                        if answer:
+                            # Add assistant response to chat history with sources
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": answer,
+                                "sources": sources
+                            })
+                        else:
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": "❌ Error generating RAG response. Please try again."
+                            })
+                    else:
+                        # Regular chat without RAG
+                        client = openai.OpenAI(api_key=st.session_state.api_key)
+                        
+                        # Create completion (non-streaming for stability)
+                        response = client.chat.completions.create(
+                            model="gpt-3.5-turbo",
+                            messages=[
+                                {"role": m["role"], "content": m["content"]}
+                                for m in st.session_state.messages
+                            ],
+                            temperature=0.7
+                        )
+                        
+                        answer = response.choices[0].message.content
+                        
+                        # Add assistant response to chat history
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        
+                except Exception as e:
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": f"❌ Error: {str(e)}"
+                    })
+                
+                # Rerun to display the new messages
                 st.rerun()
-        
-        else:
-            st.info("🔑 Please enter a valid OpenAI API key in the sidebar to start chatting")
     
-    with col2:
-        st.header("📊 Telemetry")
-        
-        if st.session_state.get('connected', False):
-            st.success("✅ Connected to OpenAI")
-            st.metric("OpenAI Status", "Active")
+    if col2:
+        with col2:
+            st.header("📊 System Status")
             
+            # Connection Status Overview
+            st.subheader("🔌 Connections")
+            
+            # OpenAI Status
+            if st.session_state.get('connected', False):
+                st.success("✅ AI Active")
+                # st.metric("OpenAI Status", "Active")
+            else:
+                st.error("❌ AI Disconnected")
+                # st.metric("OpenAI Status", "Inactive")
+                
             # PostgreSQL Status
             if st.session_state.get('pg_connected', False):
-                st.success("✅ Connected to PostgreSQL")
-                st.metric("PostgreSQL Status", "Active")
+                st.success("✅ Database Connected")
+                # st.metric("PostgreSQL Status", "Active")
             else:
-                st.warning("⚠️ PostgreSQL Disconnected")
+                st.error("❌ Database Disconnected")
+                # st.metric("PostgreSQL Status", "Inactive")
             
-            # RAG Status Section
-            st.subheader("🦙 RAG Status")
-            if st.session_state.rag_initialized:
-                doc_count = len(st.session_state.documents_processed)
-                st.success(f"✅ RAG System Active")
-                st.metric("Documents in Database", doc_count)
-                st.info("💾 Using PostgreSQL persistent storage")
+            # Overall System Status
+            if st.session_state.get('connected', False) and st.session_state.get('pg_connected', False):
+                st.success("🟢 **System Ready**")
             else:
-                st.warning("⚠️ RAG System Inactive")
+                st.warning("🟡 **Waiting for Connections**")
             
-            # Display connection details
-            st.subheader("🔗 Connection Details")
-            st.write(f"**Last Check:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            st.write(f"**API Key:** `{st.session_state.api_key[:10]}...`")
-            st.write("**OpenAI Service:** Operational")
-            if st.session_state.get('pg_connected', False):
-                st.write("**PostgreSQL:** Connected")
-                st.write(f"**Database:** {DEFAULT_PG_DATABASE}")
-            else:
-                st.write("**PostgreSQL:** Not Connected")
+            st.markdown("---")
             
-            # Chat statistics
-            if st.session_state.messages:
-                user_msgs = len([m for m in st.session_state.messages if m["role"] == "user"])
-                assistant_msgs = len([m for m in st.session_state.messages if m["role"] == "assistant"])
+            if st.session_state.get('connected', False):
                 
-                st.subheader("💬 Chat Statistics")
-                st.write(f"**User Messages:** {user_msgs}")
-                st.write(f"**AI Responses:** {assistant_msgs}")
-                st.write(f"**Total Messages:** {len(st.session_state.messages)}")
-            
-            # Processing Logs
-            st.subheader("📋 Processing Logs")
-            logs_to_show = st.session_state.processing_logs[-8:]  # Show last 8 logs
-            for log in reversed(logs_to_show):
-                log_time = datetime.fromisoformat(log['timestamp']).strftime('%H:%M:%S')
-                icon = "❌" if "ERROR" in log['type'] else "✅" if "SUCCESS" in log['type'] else "ℹ️"
-                st.write(f"{icon} **{log_time}** - {log['message']}")
+                # RAG Status Section
+                st.subheader("🦙 RAG Status")
+                if st.session_state.rag_initialized:
+                    doc_count = len(st.session_state.documents_processed)
+                    st.success(f"✅ RAG System Active")
+                    st.metric("Documents in Database", doc_count)
+                    st.info("💾 Using PostgreSQL persistent storage")
+                else:
+                    st.warning("⚠️ RAG System Inactive")
                 
-            # Export logs button
-            if st.session_state.processing_logs and st.button("Export Full Logs"):
-                log_data = {
-                    "export_time": datetime.now().isoformat(),
-                    "total_logs": len(st.session_state.processing_logs),
-                    "api_key_owner": st.session_state.api_key[:10] + "...",
-                    "logs": st.session_state.processing_logs
-                }
-                st.download_button(
-                    label="Download Logs JSON",
-                    data=json.dumps(log_data, indent=2),
-                    file_name=f"rag_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json"
-                )
-        else:
-            st.warning("⏳ Waiting for connection...")
+                # Display connection details
+                st.subheader("🔗 Connection Details")
+                st.write(f"**Last Check:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                st.write(f"**API Key:** `{st.session_state.api_key[:10]}...`")
+                st.write("**OpenAI Service:** Operational")
+                if st.session_state.get('pg_connected', False):
+                    st.write("**PostgreSQL:** Connected")
+                    st.write(f"**Database:** {DEFAULT_PG_DATABASE}")
+                else:
+                    st.write("**PostgreSQL:** Not Connected")
+                
+                # Chat statistics
+                if st.session_state.messages:
+                    user_msgs = len([m for m in st.session_state.messages if m["role"] == "user"])
+                    assistant_msgs = len([m for m in st.session_state.messages if m["role"] == "assistant"])
+                    
+                    st.subheader("💬 Chat Statistics")
+                    st.write(f"**User Messages:** {user_msgs}")
+                    st.write(f"**AI Responses:** {assistant_msgs}")
+                    st.write(f"**Total Messages:** {len(st.session_state.messages)}")
+                
+                # Processing Logs
+                st.subheader("📋 Processing Logs")
+                logs_to_show = st.session_state.processing_logs[-8:]  # Show last 8 logs
+                for log in reversed(logs_to_show):
+                    log_time = datetime.fromisoformat(log['timestamp']).strftime('%H:%M:%S')
+                    icon = "❌" if "ERROR" in log['type'] else "✅" if "SUCCESS" in log['type'] else "ℹ️"
+                    st.write(f"{icon} **{log_time}** - {log['message']}")
+                    
+                # Export logs button
+                if st.session_state.processing_logs and st.button("Export Full Logs"):
+                    log_data = {
+                        "export_time": datetime.now().isoformat(),
+                        "total_logs": len(st.session_state.processing_logs),
+                        "api_key_owner": st.session_state.api_key[:10] + "...",
+                        "logs": st.session_state.processing_logs
+                    }
+                    st.download_button(
+                        label="Download Logs JSON",
+                        data=json.dumps(log_data, indent=2),
+                        file_name=f"rag_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json"
+                    )
+            else:
+                st.warning("⏳ Waiting for connection...")
 
 if __name__ == "__main__":
     main()
